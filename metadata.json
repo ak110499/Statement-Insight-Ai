@@ -1,0 +1,5 @@
+{
+  "name": "StatementInsight AI",
+  "description": "AI-powered bank statement analyzer for insights, profit/loss tracking, and transaction grouping.",
+  "requestFramePermissions": []
+}
