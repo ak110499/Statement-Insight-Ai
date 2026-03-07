@@ -54,6 +54,8 @@ import { useDropzone } from "react-dropzone";
 import { motion, AnimatePresence } from "motion/react";
 import ReactMarkdown from "react-markdown";
 import * as pdfjs from "pdfjs-dist";
+// @ts-ignore
+import pdfWorker from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 import * as XLSX from "xlsx";
 import { jsPDF } from "jspdf";
 import autoTable from "jspdf-autotable";
@@ -61,7 +63,7 @@ import { StatementService, type Transaction, type StatementInsights, type Detail
 import { cn, formatCurrency } from "./lib/utils";
 
 // Configure PDF.js worker
-pdfjs.GlobalWorkerOptions.workerSrc = `//cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjs.version}/pdf.worker.min.mjs`;
+pdfjs.GlobalWorkerOptions.workerSrc = pdfWorker;
 
 const COLORS = ["#10b981", "#3b82f6", "#f59e0b", "#ef4444", "#8b5cf6", "#ec4899", "#06b6d4"];
 
@@ -73,10 +75,13 @@ export default function App() {
   const [chatAnswer, setChatAnswer] = useState<string | null>(null);
   const [isAsking, setIsAsking] = useState(false);
   const [filter, setFilter] = useState("");
+  const [groupSearch, setGroupSearch] = useState("");
   const [selectedGroup, setSelectedGroup] = useState<string | null>(null);
   const [sortConfig, setSortConfig] = useState<{ key: 'date' | 'amount' | 'category'; direction: 'asc' | 'desc' }>({ key: 'date', direction: 'desc' });
   const [isCategoryModalOpen, setIsCategoryModalOpen] = useState(false);
   const [editingCategory, setEditingCategory] = useState<{ oldName: string; newName: string } | null>(null);
+  const [editingTransactionCategory, setEditingTransactionCategory] = useState<{ id: string; category: string } | null>(null);
+  const [editingTransactionGroup, setEditingTransactionGroup] = useState<{ id: string; group: string } | null>(null);
   const [mergingCategory, setMergingCategory] = useState<{ source: string; target: string } | null>(null);
   const [savedAnalyses, setSavedAnalyses] = useState<{ id: string; name: string; date: string }[]>(() => {
     const saved = localStorage.getItem('statement_analyses_index');
@@ -84,10 +89,28 @@ export default function App() {
   });
   const [isHistoryOpen, setIsHistoryOpen] = useState(false);
 
-  const maxGroupTotal = useMemo(() => {
-    if (!data) return 0;
-    return Math.max(...data.insights.groups.map(g => Math.abs(g.total)));
+  const computedGroups = useMemo(() => {
+    if (!data || !data.transactions) return [];
+    const groupMap = new Map<string, { transactions: number; total: number }>();
+    
+    data.transactions.forEach(t => {
+      if (t.group) {
+        const existing = groupMap.get(t.group) || { transactions: 0, total: 0 };
+        existing.transactions += 1;
+        existing.total += (Number(t.deposit) || 0) - (Number(t.withdrawal) || 0);
+        groupMap.set(t.group, existing);
+      }
+    });
+
+    return Array.from(groupMap.entries())
+      .map(([name, stats]) => ({ name, ...stats }))
+      .sort((a, b) => Math.abs(b.total) - Math.abs(a.total));
   }, [data]);
+
+  const maxGroupTotal = useMemo(() => {
+    if (!computedGroups || !computedGroups.length) return 0;
+    return Math.max(...computedGroups.map(g => Math.abs(g.total)));
+  }, [computedGroups]);
 
   const statementService = useMemo(() => new StatementService(), []);
 
@@ -250,7 +273,7 @@ export default function App() {
     // Recalculate insights
     const categoriesMap = new Map<string, number>();
     updatedTransactions.forEach(t => {
-      const amount = t.withdrawal || 0;
+      const amount = Number(t.withdrawal) || 0;
       if (amount > 0) {
         categoriesMap.set(t.category, (categoriesMap.get(t.category) || 0) + amount);
       }
@@ -292,7 +315,7 @@ export default function App() {
     // Recalculate insights
     const categoriesMap = new Map<string, number>();
     updatedTransactions.forEach(t => {
-      const amount = t.withdrawal || 0;
+      const amount = Number(t.withdrawal) || 0;
       if (amount > 0) {
         categoriesMap.set(t.category, (categoriesMap.get(t.category) || 0) + amount);
       }
@@ -309,6 +332,51 @@ export default function App() {
       }
     });
     setMergingCategory(null);
+  };
+
+  const handleUpdateTransactionCategory = (transactionId: string, newCategory: string) => {
+    if (!data || !newCategory.trim()) return;
+
+    const updatedTransactions = data.transactions.map(t => {
+      const currentTxId = t.id || `${t.date}-${t.narration}-${t.withdrawal}-${t.deposit}`;
+      return currentTxId === transactionId ? { ...t, category: newCategory } : t;
+    });
+
+    // Recalculate insights
+    const categoriesMap = new Map<string, number>();
+    updatedTransactions.forEach(t => {
+      const amount = Number(t.withdrawal) || 0;
+      if (amount > 0) {
+        categoriesMap.set(t.category, (categoriesMap.get(t.category) || 0) + amount);
+      }
+    });
+
+    const updatedCategories = Array.from(categoriesMap.entries()).map(([name, value]) => ({ name, value }));
+
+    setData({
+      ...data,
+      transactions: updatedTransactions,
+      insights: {
+        ...data.insights,
+        categories: updatedCategories
+      }
+    });
+    setEditingTransactionCategory(null);
+  };
+
+  const handleUpdateTransactionGroup = (transactionId: string, newGroup: string) => {
+    if (!data) return;
+
+    const updatedTransactions = data.transactions.map(t => {
+      const currentTxId = t.id || `${t.date}-${t.narration}-${t.withdrawal}-${t.deposit}`;
+      return currentTxId === transactionId ? { ...t, group: newGroup.trim() || undefined } : t;
+    });
+
+    setData({
+      ...data,
+      transactions: updatedTransactions
+    });
+    setEditingTransactionGroup(null);
   };
 
   const saveCurrentAnalysis = (name: string) => {
@@ -349,15 +417,15 @@ export default function App() {
   };
 
   const filteredTransactions = useMemo(() => {
-    if (!data) return [];
+    if (!data || !data.transactions) return [];
     const filtered = data.transactions.filter(t => {
-      const matchesSearch = t.narration.toLowerCase().includes(filter.toLowerCase()) ||
-        t.category.toLowerCase().includes(filter.toLowerCase()) ||
+      const matchesSearch = t.narration?.toLowerCase().includes(filter.toLowerCase()) ||
+        t.category?.toLowerCase().includes(filter.toLowerCase()) ||
         t.group?.toLowerCase().includes(filter.toLowerCase());
       
       const matchesGroup = !selectedGroup || 
         t.group === selectedGroup || 
-        t.narration.toLowerCase().includes(selectedGroup.toLowerCase());
+        t.narration?.toLowerCase().includes(selectedGroup.toLowerCase());
       
       return matchesSearch && matchesGroup;
     });
@@ -366,15 +434,15 @@ export default function App() {
       const direction = sortConfig.direction === 'asc' ? 1 : -1;
       
       if (sortConfig.key === 'date') {
-        return (new Date(a.date).getTime() - new Date(b.date).getTime()) * direction;
+        return (new Date(a.date || 0).getTime() - new Date(b.date || 0).getTime()) * direction;
       }
       if (sortConfig.key === 'amount') {
-        const valA = a.withdrawal || a.deposit || 0;
-        const valB = b.withdrawal || b.deposit || 0;
+        const valA = Number(a.withdrawal) || Number(a.deposit) || 0;
+        const valB = Number(b.withdrawal) || Number(b.deposit) || 0;
         return (valA - valB) * direction;
       }
       if (sortConfig.key === 'category') {
-        return a.category.localeCompare(b.category) * direction;
+        return (a.category || "").localeCompare(b.category || "") * direction;
       }
       return 0;
     });
@@ -510,26 +578,26 @@ export default function App() {
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
                 <SummaryCard 
                   title="Total Deposits" 
-                  value={formatCurrency(data.insights.summary.totalDeposits)} 
+                  value={formatCurrency(data.insights.summary.totalDeposits || 0)} 
                   icon={<TrendingUp className="text-emerald-600" />}
                   trend="Income"
                 />
                 <SummaryCard 
                   title="Total Withdrawals" 
-                  value={formatCurrency(data.insights.summary.totalWithdrawals)} 
+                  value={formatCurrency(data.insights.summary.totalWithdrawals || 0)} 
                   icon={<TrendingDown className="text-rose-600" />}
                   trend="Expenses"
                 />
                 <SummaryCard 
                   title="Net Cash Flow" 
-                  value={formatCurrency(data.insights.summary.netCashFlow)} 
+                  value={formatCurrency(data.insights.summary.netCashFlow || 0)} 
                   icon={<PieChartIcon className="text-blue-600" />}
-                  trend={data.insights.summary.netCashFlow >= 0 ? "Profit" : "Loss"}
-                  trendColor={data.insights.summary.netCashFlow >= 0 ? "text-emerald-600" : "text-rose-600"}
+                  trend={(data.insights.summary.netCashFlow || 0) >= 0 ? "Profit" : "Loss"}
+                  trendColor={(data.insights.summary.netCashFlow || 0) >= 0 ? "text-emerald-600" : "text-rose-600"}
                 />
                 <SummaryCard 
                   title="Transactions" 
-                  value={data.insights.summary.transactionCount.toString()} 
+                  value={(data.insights.summary.transactionCount || 0).toString()} 
                   icon={<FileText className="text-slate-600" />}
                   trend="Total Count"
                 />
@@ -594,7 +662,7 @@ export default function App() {
                           <div className="w-3 h-3 rounded-full" style={{ backgroundColor: COLORS[i % COLORS.length] }} />
                           <span className="text-slate-600">{cat.name}</span>
                         </div>
-                        <span className="font-medium">{formatCurrency(cat.value)}</span>
+                        <span className="font-medium">{formatCurrency(cat.value || 0)}</span>
                       </div>
                     ))}
                   </div>
@@ -667,13 +735,28 @@ export default function App() {
                   </div>
 
                   {/* Grouped Entity Summary */}
-                  <div className="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm">
-                    <div className="flex items-center gap-2 mb-4">
-                      <GroupIcon className="text-purple-600 w-5 h-5" />
-                      <h3 className="font-semibold">Top Grouped Entities</h3>
+                  <div className="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm flex flex-col max-h-[600px]">
+                    <div className="flex items-center justify-between mb-4">
+                      <div className="flex items-center gap-2">
+                        <GroupIcon className="text-purple-600 w-5 h-5" />
+                        <h3 className="font-semibold">Top Grouped Entities</h3>
+                      </div>
                     </div>
-                    <div className="space-y-2">
-                      {data.insights.groups.slice(0, 5).map((group, i) => (
+                    <div className="relative mb-4 shrink-0">
+                      <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
+                      <input 
+                        type="text" 
+                        placeholder="Search groups..."
+                        value={groupSearch}
+                        onChange={(e) => setGroupSearch(e.target.value)}
+                        className="w-full pl-9 pr-4 py-2 rounded-xl border border-slate-200 focus:ring-2 focus:ring-purple-500 focus:border-transparent outline-none transition-all text-sm"
+                      />
+                    </div>
+                    <div className="space-y-2 overflow-y-auto flex-1 pr-2 -mr-2">
+                      {computedGroups
+                        .filter(g => g.name.toLowerCase().includes(groupSearch.toLowerCase()))
+                        .slice(0, groupSearch ? undefined : 5)
+                        .map((group, i) => (
                         <button 
                           key={i} 
                           onClick={() => setSelectedGroup(selectedGroup === group.name ? null : group.name)}
@@ -817,27 +900,86 @@ export default function App() {
                             <td className="px-6 py-4">
                               <div className="space-y-0.5">
                                 <p className="text-sm font-medium text-slate-900 leading-tight">{t.narration}</p>
-                                {t.group && (
-                                  <span className="inline-flex items-center gap-1 text-[10px] bg-slate-100 text-slate-500 px-1.5 py-0.5 rounded-md">
-                                    <GroupIcon className="w-2.5 h-2.5" />
-                                    {t.group}
-                                  </span>
-                                )}
+                                {(() => {
+                                  const currentTxId = t.id || `${t.date}-${t.narration}-${t.withdrawal}-${t.deposit}`;
+                                  return editingTransactionGroup?.id === currentTxId ? (
+                                    <input
+                                      type="text"
+                                      autoFocus
+                                      className="px-1.5 py-0.5 text-[10px] border border-slate-300 rounded-md focus:outline-none focus:ring-1 focus:ring-emerald-500 w-32 bg-white"
+                                      value={editingTransactionGroup.group}
+                                      onChange={(e) => setEditingTransactionGroup({ ...editingTransactionGroup, group: e.target.value })}
+                                      onKeyDown={(e) => {
+                                        if (e.key === 'Enter') {
+                                          handleUpdateTransactionGroup(currentTxId, editingTransactionGroup.group);
+                                        } else if (e.key === 'Escape') {
+                                          setEditingTransactionGroup(null);
+                                        }
+                                      }}
+                                      onBlur={() => handleUpdateTransactionGroup(currentTxId, editingTransactionGroup.group)}
+                                    />
+                                  ) : (
+                                    <div className="flex items-center min-h-[20px]">
+                                      {t.group ? (
+                                        <span 
+                                          className="inline-flex items-center gap-1 text-[10px] bg-slate-100 text-slate-500 px-1.5 py-0.5 rounded-md cursor-pointer hover:bg-slate-200 transition-colors"
+                                          onClick={() => setEditingTransactionGroup({ id: currentTxId, group: t.group || '' })}
+                                        >
+                                          <GroupIcon className="w-2.5 h-2.5" />
+                                          {t.group}
+                                        </span>
+                                      ) : (
+                                        <span 
+                                          className="inline-flex items-center gap-1 text-[10px] text-transparent group-hover:text-slate-400 px-1.5 py-0.5 cursor-pointer hover:text-slate-600 transition-colors"
+                                          onClick={() => setEditingTransactionGroup({ id: currentTxId, group: '' })}
+                                        >
+                                          + Add group
+                                        </span>
+                                      )}
+                                    </div>
+                                  );
+                                })()}
                               </div>
                             </td>
                             <td className="px-6 py-4">
-                              <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-emerald-50 text-emerald-700">
-                                {t.category}
-                              </span>
+                              {(() => {
+                                const currentTxId = t.id || `${t.date}-${t.narration}-${t.withdrawal}-${t.deposit}`;
+                                return editingTransactionCategory?.id === currentTxId ? (
+                                  <input
+                                    type="text"
+                                    autoFocus
+                                    className="px-2 py-1 text-xs border border-emerald-300 rounded-md focus:outline-none focus:ring-2 focus:ring-emerald-500 w-32 bg-white"
+                                    value={editingTransactionCategory.category}
+                                    onChange={(e) => setEditingTransactionCategory({ ...editingTransactionCategory, category: e.target.value })}
+                                    onKeyDown={(e) => {
+                                      if (e.key === 'Enter') {
+                                        handleUpdateTransactionCategory(currentTxId, editingTransactionCategory.category);
+                                      } else if (e.key === 'Escape') {
+                                        setEditingTransactionCategory(null);
+                                      }
+                                    }}
+                                    onBlur={() => handleUpdateTransactionCategory(currentTxId, editingTransactionCategory.category)}
+                                  />
+                                ) : (
+                                  <span 
+                                    className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-medium bg-emerald-50 text-emerald-700 cursor-pointer hover:bg-emerald-100 transition-colors group/cat"
+                                    onClick={() => setEditingTransactionCategory({ id: currentTxId, category: t.category })}
+                                    title="Click to edit category"
+                                  >
+                                    {t.category}
+                                    <Edit2 className="w-3 h-3 opacity-0 group-hover/cat:opacity-100 transition-opacity" />
+                                  </span>
+                                );
+                              })()}
                             </td>
                             <td className="px-6 py-4 text-right whitespace-nowrap">
                               <div className="flex flex-col items-end">
-                                {t.withdrawal > 0 ? (
-                                  <span className="text-sm font-semibold text-rose-600">-{formatCurrency(t.withdrawal)}</span>
+                                {(t.withdrawal || 0) > 0 ? (
+                                  <span className="text-sm font-semibold text-rose-600">-{formatCurrency(t.withdrawal || 0)}</span>
                                 ) : (
-                                  <span className="text-sm font-semibold text-emerald-600">+{formatCurrency(t.deposit)}</span>
+                                  <span className="text-sm font-semibold text-emerald-600">+{formatCurrency(t.deposit || 0)}</span>
                                 )}
-                                <span className="text-[10px] text-slate-400">Bal: {formatCurrency(t.balance)}</span>
+                                <span className="text-[10px] text-slate-400">Bal: {formatCurrency(t.balance || 0)}</span>
                               </div>
                             </td>
                           </tr>

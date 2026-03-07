@@ -3,6 +3,7 @@ import { GoogleGenAI, Type, ThinkingLevel } from "@google/genai";
 const GEMINI_MODEL = "gemini-3-flash-preview";
 
 export interface Transaction {
+  id: string;
   date: string;
   narration: string;
   refNo: string;
@@ -41,7 +42,8 @@ export class StatementService {
   }
 
   async parseStatement(text: string): Promise<{ transactions: Transaction[]; insights: StatementInsights }> {
-    const response = await this.ai.models.generateContent({
+    // Step 1: Extract transactions using the high-precision data parser prompt
+    const extractionResponse = await this.ai.models.generateContent({
       model: GEMINI_MODEL,
       contents: [
         {
@@ -56,52 +58,130 @@ export class StatementService {
         },
       ],
       config: {
-        systemInstruction: `You are a forensic-grade bank statement parser and financial analyst.
-        Goal: maximize recall and precision while returning strictly valid JSON.
+        thinkingConfig: { thinkingLevel: ThinkingLevel.HIGH },
+        systemInstruction: `## Role
+You are the high-precision data parser for 'StatementInsight AI'. Your task is to extract bank data from a CSV/XLS format into a strict JSON array.
 
-        Parsing protocol (follow in order):
-        1. Reconstruct rows from noisy OCR by aligning likely columns: Date | Narration | Ref No | Withdrawal | Deposit | Balance.
-        2. Extract EVERY transaction row exactly once. Never merge two rows into one.
-        3. Monetary accuracy rules:
-           - Use plain numbers only (no currency symbols/commas).
-           - Amounts must be absolute non-negative values.
-           - Exactly one of withdrawal or deposit should be > 0 for normal transactions.
-           - If sign is ambiguous, infer using balance movement and narration.
-        4. Date handling:
-           - Preserve statement order.
-           - Keep date text as shown if format is uncertain.
-        5. Narration/ref cleanup:
-           - Keep narration informative but concise.
-           - refNo must be a string (empty string if unavailable).
-        6. Categorization:
-           - Use specific categories (e.g., Groceries, Utilities, EMI, Salary, Rent, Transfer, Cash Withdrawal, Fees, Interest).
-           - Add group for repeated counterparties/merchants and use exact same names in insights.groups.
-        7. Insights quality:
-           - summary.transactionCount must equal transactions.length.
-           - summary totals must match extracted transactions.
-           - categories should represent spending distribution (withdrawals).
-           - anomalies should be evidence-based (spikes, duplicate debits, unusual fees, balance drops).
-           - recommendations should be actionable and tied to detected patterns.
-        8. If OCR is partial, still output best-effort extraction and avoid fabricating unsupported values.`,
+## Column Mapping Rules (Crucial)
+1. 'Date' is in Column 1.
+2. 'Narration' is in Column 2. Capture the FULL text; do not truncate or rephrase.
+3. 'Chq./Ref.No.' is in Column 3. Include this in your internal analysis to identify unique transactions.
+4. 'Value Dt' is in Column 4.
+5. 'Withdrawal Amt.' is in Column 5.
+6. 'Deposit Amt.' is in Column 6.
+7. 'Closing Balance' is in Column 7.
+
+## Processing Instructions
+- STARTING POINT: Begin extraction only from the row containing actual transaction data (after the headers).
+- NO SUMMARIZATION: Every single row with an amount must be its own object in the JSON array.
+- ESCAPE CHARACTERS: Bank narrations often contain slashes (/), dashes (-), and quotes ("). You MUST escape these characters to prevent JSON "Expected ',' or ']'" errors.
+- CLEAN NUMBERS: Remove all commas from currency values (e.g., "4,864.00" becomes 4864.00) before placing them in the JSON.
+
+## Output Format
+Return ONLY a valid JSON array of objects:
+[
+  {
+    "date": "DD/MM/YY",
+    "narration": "Full text from column 2",
+    "reference": "Text from column 3",
+    "amount": 0.00,
+    "type": "debit" | "credit",
+    "balance": 0.00
+  }
+]`,
+        responseMimeType: "application/json",
+        responseSchema: {
+          type: Type.ARRAY,
+          items: {
+            type: Type.OBJECT,
+            properties: {
+              date: { type: Type.STRING },
+              narration: { type: Type.STRING },
+              reference: { type: Type.STRING },
+              amount: { type: Type.NUMBER },
+              type: { type: Type.STRING, enum: ["debit", "credit"] },
+              balance: { type: Type.NUMBER },
+            },
+            required: ["date", "narration", "reference", "amount", "type", "balance"],
+          },
+        },
+      },
+    });
+
+    let extractedTransactions: any[] = [];
+    try {
+      let jsonText = extractionResponse.text || "[]";
+      const match = jsonText.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
+      if (match) {
+        jsonText = match[1];
+      } else {
+        const start = jsonText.indexOf('[');
+        const end = jsonText.lastIndexOf(']');
+        if (start !== -1 && end !== -1 && end > start) {
+          jsonText = jsonText.substring(start, end + 1);
+        }
+      }
+      extractedTransactions = JSON.parse(jsonText);
+    } catch (e) {
+      console.error("Failed to parse extraction response", e);
+      throw new Error("Failed to extract statement data.");
+    }
+
+    // Map to internal Transaction format
+    let transactions: Transaction[] = extractedTransactions.map((item: any, index: number) => {
+      const isDebit = item.type === "debit";
+      return {
+        id: `tx-${Date.now()}-${index}`,
+        date: item.date,
+        narration: item.narration,
+        refNo: item.reference,
+        withdrawal: isDebit ? item.amount : 0,
+        deposit: isDebit ? 0 : item.amount,
+        balance: item.balance,
+        category: "Uncategorized",
+        group: undefined
+      };
+    });
+
+    // Step 2: Generate Insights, Categories, and Groups
+    const insightsResponse = await this.ai.models.generateContent({
+      model: GEMINI_MODEL,
+      contents: [
+        {
+          role: "user",
+          parts: [
+            {
+              text: `Analyze these transactions and provide categories, groups, and insights.
+              Transactions:
+              ${JSON.stringify(transactions)}`,
+            },
+          ],
+        },
+      ],
+      config: {
+        thinkingConfig: { thinkingLevel: ThinkingLevel.HIGH },
+        systemInstruction: `You are a meticulous financial data analyst.
+        Task: Analyze the provided transactions.
+        
+        Strict Rules:
+        1. Categorize each transaction logically (e.g., Food, Salary, Rent). Return an array of updates mapped to transaction IDs.
+        2. Grouping is CRITICAL: Group recurring vendors or entities accurately. For example, if there are 12 transactions for "Haier Appliances", all 12 must have the exact same "group" value. Ensure the "group" field matches the names in "insights.groups" exactly. Be highly sensitive to variations in vendor names and group them under a single unified name.
+        3. Provide accurate summary totals (deposits, withdrawals, net flow).
+        4. Identify anomalies (unusual spikes, double charges) and recommendations.`,
         responseMimeType: "application/json",
         responseSchema: {
           type: Type.OBJECT,
           properties: {
-            transactions: {
+            transactionUpdates: {
               type: Type.ARRAY,
               items: {
                 type: Type.OBJECT,
                 properties: {
-                  date: { type: Type.STRING },
-                  narration: { type: Type.STRING },
-                  refNo: { type: Type.STRING },
-                  withdrawal: { type: Type.NUMBER },
-                  deposit: { type: Type.NUMBER },
-                  balance: { type: Type.NUMBER },
+                  id: { type: Type.STRING },
                   category: { type: Type.STRING },
                   group: { type: Type.STRING },
                 },
-                required: ["date", "narration", "refNo", "withdrawal", "deposit", "balance", "category"],
+                required: ["id", "category"],
               },
             },
             insights: {
@@ -164,6 +244,7 @@ export class StatementService {
                   },
                 },
               },
+              required: ["summary", "categories", "groups", "anomalies", "recommendations"],
             },
           },
         },
@@ -171,10 +252,55 @@ export class StatementService {
     });
 
     try {
-      const parsed = JSON.parse(response.text || "{}");
-      return this.normalizeResult(parsed);
+      let jsonText = insightsResponse.text || "{}";
+      const match = jsonText.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
+      if (match) {
+        jsonText = match[1];
+      } else {
+        const start = jsonText.indexOf('{');
+        const end = jsonText.lastIndexOf('}');
+        if (start !== -1 && end !== -1 && end > start) {
+          jsonText = jsonText.substring(start, end + 1);
+        }
+      }
+      const result = JSON.parse(jsonText);
+      
+      // Apply updates to transactions
+      if (result.transactionUpdates) {
+        const updateMap = new Map<string, any>(result.transactionUpdates.map((u: any) => [u.id, u]));
+        transactions = transactions.map(t => {
+          const update = updateMap.get(t.id);
+          if (update) {
+            return {
+              ...t,
+              category: update.category || t.category,
+              group: update.group || t.group
+            };
+          }
+          return t;
+        });
+      }
+
+      // Ensure defaults to prevent crashes
+      if (!result.insights) {
+        result.insights = {
+          summary: { totalDeposits: 0, totalWithdrawals: 0, netCashFlow: 0, transactionCount: 0 },
+          categories: [],
+          groups: [],
+          anomalies: [],
+          recommendations: []
+        };
+      } else {
+        if (!result.insights.summary) result.insights.summary = { totalDeposits: 0, totalWithdrawals: 0, netCashFlow: 0, transactionCount: 0 };
+        if (!result.insights.categories) result.insights.categories = [];
+        if (!result.insights.groups) result.insights.groups = [];
+        if (!result.insights.anomalies) result.insights.anomalies = [];
+        if (!result.insights.recommendations) result.insights.recommendations = [];
+      }
+      
+      return { transactions, insights: result.insights };
     } catch (e) {
-      console.error("Failed to parse AI response", e);
+      console.error("Failed to parse insights response", e);
       throw new Error("Failed to analyze statement data.");
     }
   }
@@ -198,84 +324,5 @@ export class StatementService {
     });
 
     return response.text || "I couldn't find an answer to that.";
-  }
-
-  private toNumber(value: unknown): number {
-    if (typeof value === "number" && Number.isFinite(value)) return value;
-    if (typeof value === "string") {
-      const cleaned = value.replace(/[^\d.-]/g, "");
-      const parsed = Number(cleaned);
-      return Number.isFinite(parsed) ? parsed : 0;
-    }
-    return 0;
-  }
-
-  private normalizeResult(raw: any): { transactions: Transaction[]; insights: StatementInsights } {
-    const rawTransactions = Array.isArray(raw?.transactions) ? raw.transactions : [];
-    const transactions: Transaction[] = rawTransactions.map((tx: any) => {
-      const withdrawal = Math.max(0, this.toNumber(tx?.withdrawal));
-      const deposit = Math.max(0, this.toNumber(tx?.deposit));
-      const balance = this.toNumber(tx?.balance);
-
-      return {
-        date: String(tx?.date ?? "").trim(),
-        narration: String(tx?.narration ?? "").trim(),
-        refNo: String(tx?.refNo ?? "").trim(),
-        withdrawal,
-        deposit,
-        balance,
-        category: String(tx?.category ?? "Uncategorized").trim() || "Uncategorized",
-        group: tx?.group ? String(tx.group).trim() : undefined,
-      };
-    });
-
-    const totalDeposits = transactions.reduce((sum, tx) => sum + tx.deposit, 0);
-    const totalWithdrawals = transactions.reduce((sum, tx) => sum + tx.withdrawal, 0);
-    const netCashFlow = totalDeposits - totalWithdrawals;
-
-    const categoriesMap = new Map<string, number>();
-    transactions.forEach((tx) => {
-      if (tx.withdrawal > 0) {
-        categoriesMap.set(tx.category, (categoriesMap.get(tx.category) || 0) + tx.withdrawal);
-      }
-    });
-
-    const groupsMap = new Map<string, { transactions: number; total: number }>();
-    transactions.forEach((tx) => {
-      if (!tx.group) return;
-      const current = groupsMap.get(tx.group) || { transactions: 0, total: 0 };
-      current.transactions += 1;
-      current.total += tx.deposit - tx.withdrawal;
-      groupsMap.set(tx.group, current);
-    });
-
-    const normalizeInsight = (item: any): DetailedInsight => ({
-      title: String(item?.title ?? "Untitled insight").trim(),
-      description: String(item?.description ?? "").trim(),
-      impact: item?.impact ? String(item.impact).trim() : undefined,
-      severity: ["low", "medium", "high"].includes(item?.severity) ? item.severity : "medium",
-    });
-
-    return {
-      transactions,
-      insights: {
-        summary: {
-          totalDeposits,
-          totalWithdrawals,
-          netCashFlow,
-          transactionCount: transactions.length,
-        },
-        categories: Array.from(categoriesMap.entries()).map(([name, value]) => ({ name, value })),
-        groups: Array.from(groupsMap.entries()).map(([name, data]) => ({
-          name,
-          transactions: data.transactions,
-          total: data.total,
-        })),
-        anomalies: Array.isArray(raw?.insights?.anomalies) ? raw.insights.anomalies.map(normalizeInsight) : [],
-        recommendations: Array.isArray(raw?.insights?.recommendations)
-          ? raw.insights.recommendations.map(normalizeInsight)
-          : [],
-      },
-    };
   }
 }
