@@ -599,7 +599,7 @@ export default function App() {
                   title="Transactions" 
                   value={(data.insights.summary.transactionCount || 0).toString()} 
                   icon={<FileText className="text-slate-600" />}
-                  trend="Total Count"
+                  trend={`${data.insights.summary.drCount || 0} DR / ${data.insights.summary.crCount || 0} CR`}
                 />
               </div>
 
